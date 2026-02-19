@@ -30,3 +30,7 @@ __pycache__/
 frontend/.next/
 frontend/out/
 frontend/node_modules/
+
+# Runtime Files
+backend/market_cache.json
+backend/telegram_settings.json

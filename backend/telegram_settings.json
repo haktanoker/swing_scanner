@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "filters": {
+    "rsi_1d": {
+      "max": 40
+    },
+    "stoch_1d": {
+      "k_lt": 40
+    },
+    "max_supply_only": true,
+    "stoch_4h": {
+      "k_lt": 40
+    },
+    "ha_4h": "green",
+    "min_circulating_ratio": 30,
+    "rsi_4h": {
+      "max": 40
+    }
+  }
+}

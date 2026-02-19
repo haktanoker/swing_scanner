@@ -1,6 +1,8 @@
 import requests
 import pandas as pd
 import time
+import os
+import json as _json
 
 from app.services.indicators import (
     calculate_rsi,
@@ -8,11 +10,15 @@ from app.services.indicators import (
     calculate_stoch_rsi,
     calculate_heikin_ashi_state,
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# Thread-safe progress için lock
+_progress_lock = threading.Lock()
 
 # binance.py update_state ile artık konuşmuyor
 # scheduler / main.py yönetecek
 from app.services.cmc import fetch_cmc_supply_batched
-
 
 BINANCE_FAPI_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_24H_TICKER = "https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -23,6 +29,25 @@ DEV_LIMIT = None  # test için → prod'da None yap
 # 🔥 Basit in-memory cache
 RSI_CACHE = {}
 RSI_CACHE_TS = {}
+CACHE_FILE = "market_cache.json"
+
+def save_market_cache(data: list, last_update: str):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            _json.dump({"data": data, "last_update": last_update}, f, ensure_ascii=False)
+        print(f"[CACHE] saved {len(data)} coins")
+    except Exception as e:
+        print(f"[CACHE] save failed: {e}")
+
+def load_market_cache() -> dict | None:
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return None
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception as e:
+        print(f"[CACHE] load failed: {e}")
+        return None
 
 # 🔥 Progress durumu
 PROGRESS = {
@@ -112,6 +137,62 @@ def get_funding_rates():
 
     return funding_map
 
+def fetch_all_indicators_for_symbol(symbol: str, ticker_item: dict, cmc_supply_map: dict, funding_map: dict) -> dict | None:
+    try:
+        (
+            rsi_1h, rsi_sma_1h, k_1h, d_1h, ha_1h, _is_new_1h,
+            rsi_cross_up_1h, rsi_cross_down_1h, stoch_cross_up_1h, stoch_cross_down_1h,
+        ) = fetch_indicators(symbol, "1h", 3600)
+
+        (
+            rsi_4h, rsi_sma_4h, k_4h, d_4h, ha_4h, _is_new_4h,
+            rsi_cross_up_4h, rsi_cross_down_4h, stoch_cross_up_4h, stoch_cross_down_4h,
+        ) = fetch_indicators(symbol, "4h", 14400)
+
+        (
+            rsi_1d, rsi_sma_1d, k_1d, d_1d, ha_1d, is_new_1d,
+            rsi_cross_up_1d, rsi_cross_down_1d, stoch_cross_up_1d, stoch_cross_down_1d,
+        ) = fetch_indicators(symbol, "1d", 86400)
+
+        base = symbol.replace("USDT", "")
+        supply = cmc_supply_map.get(base, {}) or {}
+
+        return {
+            "symbol": symbol,
+            "price": float(ticker_item["lastPrice"]),
+            "change24h": float(ticker_item["priceChangePercent"]),
+            "volume": float(ticker_item["quoteVolume"]),
+            "funding": funding_map.get(symbol, 0.0),
+            "rsi_1h": rsi_1h, "rsi_4h": rsi_4h, "rsi_1d": rsi_1d,
+            "rsi_sma_1h": rsi_sma_1h, "rsi_sma_4h": rsi_sma_4h, "rsi_sma_1d": rsi_sma_1d,
+            "rsi_cross_up_1h_recent": bool(rsi_cross_up_1h),
+            "rsi_cross_down_1h_recent": bool(rsi_cross_down_1h),
+            "rsi_cross_up_4h_recent": bool(rsi_cross_up_4h),
+            "rsi_cross_down_4h_recent": bool(rsi_cross_down_4h),
+            "rsi_cross_up_1d_recent": bool(rsi_cross_up_1d),
+            "rsi_cross_down_1d_recent": bool(rsi_cross_down_1d),
+            "stoch_k_1h": k_1h, "stoch_d_1h": d_1h,
+            "stoch_k_4h": k_4h, "stoch_d_4h": d_4h,
+            "stoch_k_1d": k_1d, "stoch_d_1d": d_1d,
+            "stoch_cross_up_1h_recent": bool(stoch_cross_up_1h),
+            "stoch_cross_down_1h_recent": bool(stoch_cross_down_1h),
+            "stoch_cross_up_4h_recent": bool(stoch_cross_up_4h),
+            "stoch_cross_down_4h_recent": bool(stoch_cross_down_4h),
+            "stoch_cross_up_1d_recent": bool(stoch_cross_up_1d),
+            "stoch_cross_down_1d_recent": bool(stoch_cross_down_1d),
+            "ha_1h": ha_1h, "ha_4h": ha_4h, "ha_1d": ha_1d,
+            "is_new": is_new_1d,
+            "max_supply": supply.get("max"),
+            "circulating_supply": supply.get("circulating"),
+            "circulating_ratio": supply.get("ratio"),
+        }
+    except Exception as e:
+        print(f"[PARALLEL] {symbol} failed: {e}")
+        return None
+    finally:
+        with _progress_lock:
+            PROGRESS["done"] += 1
+
 def get_futures_market_data():
     all_active_symbols = list(get_futures_symbols())
 
@@ -120,141 +201,58 @@ def get_futures_market_data():
     else:
         active_symbols = all_active_symbols
 
-
     funding_map = get_funding_rates()
 
-    # =========================
-    # 🔥 CMC – BASE COIN LİSTESİ
-    # =========================
+    # CMC – arz verileri
     bases = list({sym.replace("USDT", "") for sym in active_symbols})
-
-    # ✅ 80'lik chunk ile çek
     cmc_supply_map = {}
     CHUNK_SIZE = 80
 
     for i in range(0, len(bases), CHUNK_SIZE):
-        chunk = bases[i : i + CHUNK_SIZE]
-
+        chunk = bases[i: i + CHUNK_SIZE]
         try:
             part = fetch_cmc_supply_batched(chunk)
             if isinstance(part, dict):
                 cmc_supply_map.update(part)
-
-        except Exception as e:
-            # print("[CMC] chunk skipped")
+        except Exception:
             pass
-
         time.sleep(1.2)
 
-
+    # 24h ticker
     resp = requests.get(BINANCE_24H_TICKER, timeout=20)
     resp.raise_for_status()
-    data = resp.json()
+    ticker_data = resp.json()
 
+    # Ticker map oluştur
+    ticker_map = {
+        item["symbol"]: item
+        for item in ticker_data
+        if item.get("symbol") in active_symbols
+    }
+
+    # Progress sıfırla
+    PROGRESS["done"] = 0
+    PROGRESS["total"] = len(active_symbols)
+
+    # 🔥 Paralel çekim — 20 thread
     out = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {
+            executor.submit(
+                fetch_all_indicators_for_symbol,
+                symbol,
+                ticker_map[symbol],
+                cmc_supply_map,
+                funding_map,
+            ): symbol
+            for symbol in active_symbols
+            if symbol in ticker_map
+        }
 
-    for item in data:
-        symbol = item.get("symbol", "")
-        if symbol not in active_symbols:
-            continue
-
-        (
-            rsi_1h,
-            rsi_sma_1h,
-            k_1h,
-            d_1h,
-            ha_1h,
-            _is_new_1h,
-            rsi_cross_up_1h,
-            rsi_cross_down_1h,
-            stoch_cross_up_1h,
-            stoch_cross_down_1h,
-        ) = fetch_indicators(symbol, "1h", 3600)
-
-        (
-            rsi_4h,
-            rsi_sma_4h,
-            k_4h,
-            d_4h,
-            ha_4h,
-            _is_new_4h,
-            rsi_cross_up_4h,
-            rsi_cross_down_4h,
-            stoch_cross_up_4h,
-            stoch_cross_down_4h,
-        ) = fetch_indicators(symbol, "4h", 14400)
-
-        (
-            rsi_1d,
-            rsi_sma_1d,
-            k_1d,
-            d_1d,
-            ha_1d,
-            is_new_1d,
-            rsi_cross_up_1d,
-            rsi_cross_down_1d,
-            stoch_cross_up_1d,
-            stoch_cross_down_1d,
-        ) = fetch_indicators(symbol, "1d", 86400)
-
-        base = symbol.replace("USDT", "")
-        supply = cmc_supply_map.get(base, {}) or {}
-
-        out.append({
-            "symbol": symbol,
-            "price": float(item["lastPrice"]),
-            "change24h": float(item["priceChangePercent"]),
-            "volume": float(item["quoteVolume"]),
-            "funding": funding_map.get(symbol, 0.0),
-
-            # RSI
-            "rsi_1h": rsi_1h,
-            "rsi_4h": rsi_4h,
-            "rsi_1d": rsi_1d,
-
-            "rsi_sma_1h": rsi_sma_1h,
-            "rsi_sma_4h": rsi_sma_4h,
-            "rsi_sma_1d": rsi_sma_1d,
-
-            # ✅ RSI CROSS (son 3 mum)
-            "rsi_cross_up_1h_recent": bool(rsi_cross_up_1h),
-            "rsi_cross_down_1h_recent": bool(rsi_cross_down_1h),
-            "rsi_cross_up_4h_recent": bool(rsi_cross_up_4h),
-            "rsi_cross_down_4h_recent": bool(rsi_cross_down_4h),
-            "rsi_cross_up_1d_recent": bool(rsi_cross_up_1d),
-            "rsi_cross_down_1d_recent": bool(rsi_cross_down_1d),
-
-            # STOCH
-            "stoch_k_1h": k_1h,
-            "stoch_d_1h": d_1h,
-            "stoch_k_4h": k_4h,
-            "stoch_d_4h": d_4h,
-            "stoch_k_1d": k_1d,
-            "stoch_d_1d": d_1d,
-
-            # ✅ STOCH CROSS (son 3 mum)
-            "stoch_cross_up_1h_recent": bool(stoch_cross_up_1h),
-            "stoch_cross_down_1h_recent": bool(stoch_cross_down_1h),
-            "stoch_cross_up_4h_recent": bool(stoch_cross_up_4h),
-            "stoch_cross_down_4h_recent": bool(stoch_cross_down_4h),
-            "stoch_cross_up_1d_recent": bool(stoch_cross_up_1d),
-            "stoch_cross_down_1d_recent": bool(stoch_cross_down_1d),
-
-            # HEIKIN
-            "ha_1h": ha_1h,
-            "ha_4h": ha_4h,
-            "ha_1d": ha_1d,
-
-            # NEW COIN
-            "is_new": is_new_1d,
-
-            # 🔥 CMC SUPPLY
-            "max_supply": supply.get("max"),
-            "circulating_supply": supply.get("circulating"),
-            "circulating_ratio": supply.get("ratio"),
-        })
-
-        PROGRESS["done"] += 1
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                out.append(result)
 
     return out
 

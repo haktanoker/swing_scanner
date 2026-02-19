@@ -21,10 +21,9 @@ type SortKey =
 
 type SortDir = "asc" | "desc" | null;
 
-export default function CoinTable({ data }: { data: CoinRow[] }) {
+export default function CoinTable({ data,search }: { data: CoinRow[]; search: string}) {
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
-  const [search, setSearch] = useState("");
   const filteredData = useMemo(() => {
     if (!search.trim()) return data;
 
@@ -260,16 +259,6 @@ export default function CoinTable({ data }: { data: CoinRow[] }) {
 
   return (
     <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 backdrop-blur">
-      {/* SEARCH BAR */}
-      <div className="p-4 border-b border-zinc-800">
-        <input
-          type="text"
-          placeholder="Coin ara... (BTC, ETH, SOL...)"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-2 text-sm text-zinc-200 focus:outline-none focus:border-zinc-500"
-        />
-      </div>
       <table className="w-full text-sm">
         <thead className="border-b border-zinc-800">
           <tr>
@@ -312,7 +301,7 @@ export default function CoinTable({ data }: { data: CoinRow[] }) {
                       NEW
                     </span>
                   )}
-                  <span>{coin.symbol}</span>
+                  <span>{coin.symbol.replace(/USDT$/, "")}</span>
                 </div>
               </td>
 
