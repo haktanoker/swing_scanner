@@ -27,6 +27,7 @@ from app.services.telegram import (
 )
 
 LAST_RUN_SLOT = None  # "2024-01-01 14:00" veya "14:30" gibi 30 dakikalık slot
+LAST_TELEGRAM_SLOT = None
 
 app = FastAPI(title="Swing Scanner API", version="1.2.0")
 
@@ -83,9 +84,19 @@ def run_market_update():
         # 🔥 Dosyaya kaydet
         save_market_cache(data, now)
 
-        # 🔥 Telegram bildirim
+        # 🔥 Telegram bildirim (saatte bir)
         try:
-            check_and_notify(data)
+            global LAST_TELEGRAM_SLOT
+            now = datetime.now(timezone.utc)
+            turkey_hour = (now.hour + 3) % 24
+            hourly_slot = now.strftime("%Y-%m-%d ") + f"{turkey_hour:02d}"
+            
+            if hourly_slot != LAST_TELEGRAM_SLOT:
+                LAST_TELEGRAM_SLOT = hourly_slot
+                check_and_notify(data)
+                print(f"[TELEGRAM] sent for slot {hourly_slot}")
+            else:
+                print(f"[TELEGRAM] skipping, already sent for slot {hourly_slot}")
         except Exception:
             traceback.print_exc()
 
